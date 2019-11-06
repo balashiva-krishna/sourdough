@@ -36,7 +36,7 @@ def system_call(command):
 
 
 name = 'sourdough'
-version = '0.12.5'
+version = '0.12.6'
 
 
 class CleanCommand(Command):
@@ -92,6 +92,7 @@ setup(
     "Topic :: System :: Systems Administration",
   ],
   keywords=['aws', 'chef', 'cloud', 'configuration-management', 'ec2'],
+  scripts=['scripts/chef-run-wrapper'],
   entry_points={
     "console_scripts": [
       "sourdough = %s.cli.commands:sourdoughDriver" % name,

@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+#
+# Copyright 2019, Castlight Health
+#
+# Wrapper script to start chef.
+# * Runs helper scripts before attempting to run chef-client
+# * If RANDOM_DELAY is set, waits up to $RANDOM_DELAY seconds before running
+# * If chef fails, documents that in $FAILURE_D so the fail count can be
+#   displayed in /etc/motd
+#
+# We want to at least check for a bad yum database and repair it if necessary.
+
+set -o pipefail
+
+PREP_D='/etc/chef-prerequisites.d'
+STARTER_LOG='/var/log/chef-starter/chef-run.log'
+FAILURE_D='etc/castlight/chef/failures'
+LAST_CHEF_RUN_F='/etc/castlight/flags/last-chef-run'
+
+
+echo_blue() {
+  if [[ -z "$NO_ANSI" ]]; then
+    ansi --blue "$@"
+    echo
+  else
+    echo "$@"
+  fi
+}
+
+echo_red() {
+  if [[ -z "$NO_ANSI" ]]; then
+    ansi --red "$@"
+    echo
+  else
+    echo "$@"
+  fi
+}
+
+croak() {
+  echo_red "$@"
+  exit 1
+}
+
+notify() {
+  if [[ "${VERBOSE}" != "false" ]]; then
+    echo_green "$@"
+  fi
+}
+
+cleanup() {
+  echo "in cleanup"
+  # Don't leave cruft lying around if we fail
+  if [[ -n "$TEMP_LOG_D" ]]; then
+    if [[ -d "$TEMP_LOG_D" ]]; then
+      rm -frv "$TEMP_LOG_D"
+    fi
+  fi
+}
+
+failOnAMac() {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    croak "Do not run this on a Mac, bailing."
+  fi
+}
+
+ensureRunningAsRoot() {
+  if [[ "$(whoami)" != "root" ]]; then
+    croak "This script must be run by root or with sudo"
+  fi
+}
+
+run-sourdough-prerequisites() {
+  if [[ ! -d "$PREP_D" ]]; then
+    rm -fvr "$TEMP_LOG_D"
+    croak "$PREP_D is not a directory!"
+  fi
+  for prep_script in "$PREP_D"/*
+  do
+    if [[ -x "$prep_script" ]]; then
+      echo_blue "Running $prep_script"
+      scriptlog=$(basename "$TEMP_LOG_D/$prep_script.log")
+      $prep_script | tee "$scriptlog"
+      logger -t chef-prerequisites < "$scriptlog"
+    fi
+  done
+}
+
+log-all-output() {
+  mkdir -p /var/log/chef-starter
+  # We use mktemp to make $TEMP_LOG_D every run, so this isn't going to
+  # spam the hell out of chef-run.log like it appears.
+  # shellcheck disable=SC2086,SC2129
+  cat "$TEMP_LOG_D"/*.log >> "${STARTER_LOG}"
+  if [[ -n "$CHEF_FAILED" ]]; then
+    DATETIME=$(date +%Y-%m-%d_%H-%M-%S)
+    mkdir -p "$FAILURE_D"
+    echo "Failed on $DATETIME" > "${FAILURE_D}/${DATETIME}.fail"
+    # shellcheck disable=SC2129
+    echo >> "${FAILURE_D}/${DATETIME}.fail"
+    banner 'FAIL' >> "${FAILURE_D}/${DATETIME}.fail"
+    echo >> "${FAILURE_D}/${DATETIME}.fail"
+    cat "$TEMP_LOG_D"/*.log >> "${FAILURE_D}/${DATETIME}.fail"
+  fi
+}
+
+avoid-forbidden-coprocess() {
+  if [[ $# -ne 1 ]]; then
+    croak "avoid-forbidden-coprocess takes one argument"
+  fi
+  echo_blue "Checking if $1 is already running..."
+  # shellcheck disable=SC2086,SC2009,SC2126
+  forbidden_count=$(ps wax | grep $1 | grep -v grep | wc -l)
+  # shellcheck disable=SC2004
+  if (( $forbidden_count > 0 )); then
+    echo "ERROR: Found $forbidden_count $1 processes already running, aborting chef start" >> "${STARTER_LOG}"
+    logger -t chef "ERROR: Found $forbidden_count $1 processes already running, aborting chef start"
+    croak "ERROR: Found $forbidden_count $1 processes already running, aborting chef start"
+  fi
+}
+
+avoid-thundering-herd() {
+  avoid-forbidden-coprocess 'chef-client'
+  avoid-forbidden-coprocess 'sourdough'
+}
+
+random-delay() {
+  if [[ -n "$RANDOM_DELAY" ]]; then
+    echo_blue "Waiting up to $RANDOM_DELAY seconds to start chef"
+    randsleep "$RANDOM_DELAY"
+  fi
+}
+
+run-chef() {
+  # shellcheck disable=SC2012
+  fail_count=$(ls $FAILURE_D | wc -w)
+  # shellcheck disable=SC2004
+  if (( $fail_count > 0 )); then
+    echo_red "There have been $fail_count chef run failures since the last successful run"
+  fi
+  sourdough-starter | tee "$TEMP_LOG_D"/999-sourdough.log
+  # shellcheck disable=SC2181
+  if (( $? > 0 )); then
+    banner "$0 failed"
+    CHEF_FAILED='True'
+  else
+    rm -fv "$FAILURE_D"/*.fail
+    date > "$LAST_CHEF_RUN_F"
+  fi
+}
+
+main() {
+  export PATH="$PATH:/usr/local/sbin:/usr/local/bin"
+  # shellcheck disable=SC2155
+  export TEMP_LOG_D=$(mktemp -d)
+  notify "Writing scratch files to $TEMP_LOG_D"
+
+  trap cleanup EXIT
+
+  ensureRunningAsRoot
+  failOnAMac
+  random-delay
+  avoid-thundering-herd
+  run-sourdough-prerequisites
+  run-chef
+  log-all-output
+}
+
+main
